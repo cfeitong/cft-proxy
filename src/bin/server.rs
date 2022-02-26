@@ -1,18 +1,20 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, bail, Result};
-use socks5::{Method, MethodNegotiation, MethodSelectionMessage, SocksRequest};
-use tokio::net::{TcpListener, TcpStream};
+use cft_proxy::{
+    socks5::{self, Method, MethodNegotiation, MethodSelectionMessage, SocksReply, SocksRequest},
+    ObfucationAsyncReader, ObfucationAsyncWriter,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, TcpStream},
+};
 use tracing::{error, info};
-
-use crate::socks5::SocksReply;
-
-mod socks5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let listener = TcpListener::bind(("0.0.0.0", 1080)).await?;
+    let listener = TcpListener::bind(("0.0.0.0", 1090)).await?;
     loop {
         match listener.accept().await {
             Ok((conn, _peer_addr)) => {
@@ -30,16 +32,19 @@ async fn main() -> Result<()> {
 }
 
 async fn on_connection(mut conn: TcpStream) -> Result<()> {
-    let method_negotiation = MethodNegotiation::parse(&mut conn).await?;
+    let (reader, writer) = conn.split();
+    let mut conn_reader = ObfucationAsyncReader::new(reader);
+    let mut conn_writer = ObfucationAsyncWriter::new(writer);
+    let method_negotiation = MethodNegotiation::parse(&mut conn_reader).await?;
     if !method_negotiation.methods.contains(&Method::NoAuth) {
         bail!("authentication is not supported");
     }
     let method_selection_message = MethodSelectionMessage {
         method: Method::NoAuth,
     };
-    method_selection_message.send(&mut conn).await?;
+    method_selection_message.send(&mut conn_writer).await?;
 
-    while let Ok(request) = SocksRequest::parse(&mut conn).await {
+    while let Ok(request) = SocksRequest::parse(&mut conn_reader).await {
         let addr: SocketAddr = match request.addr_type {
             socks5::AddrType::IPv4 => {
                 let ip: [u8; 4] = request
@@ -68,8 +73,8 @@ async fn on_connection(mut conn: TcpStream) -> Result<()> {
                     .await
                     .map_err(|_| anyhow!("fail to connect to {}:{}", addr, request.dest_port))?;
                 let reply = SocksReply::success();
-                reply.send(&mut conn).await?;
-                establish_connection(remote, &mut conn).await?;
+                reply.send(&mut conn_writer).await?;
+                establish_connection(remote, &mut conn_reader, &mut conn_writer).await?;
             }
             socks5::RequestCommand::Bind => error!("bind is not supported"),
             socks5::RequestCommand::UdpAssociate => error!("udp associate is not supported"),
@@ -78,9 +83,12 @@ async fn on_connection(mut conn: TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn establish_connection(mut a: TcpStream, b: &mut TcpStream) -> Result<()> {
+async fn establish_connection(
+    mut a: TcpStream,
+    mut rx_b: impl AsyncRead + Unpin,
+    mut tx_b: impl AsyncWrite + Unpin,
+) -> Result<()> {
     let (mut rx_a, mut tx_a) = a.split();
-    let (mut rx_b, mut tx_b) = b.split();
     let f1 = tokio::io::copy(&mut rx_a, &mut tx_b);
     let f2 = tokio::io::copy(&mut rx_b, &mut tx_a);
     tokio::try_join!(f1, f2)?;
